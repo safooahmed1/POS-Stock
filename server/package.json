@@ -6,7 +6,8 @@
   "main": "index.js",
   "scripts": {
     "dev": "node --watch --env-file=.env index.js",
-    "start": "node --env-file=.env index.js"
+    "start": "node --env-file=.env index.js",
+    "build": "echo 'No build step required for server'"
   },
   "dependencies": {
     "@libsql/client": "^0.14.0",
