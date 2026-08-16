@@ -1,27 +1,17 @@
 {
   "version": 2,
-  "buildCommand": "npm run build && cp -r client/dist dist",
+  "installCommand": "npm install && cd client && npm install",
+  "buildCommand": "cd client && npm run build && cd .. && cp -r client/dist dist",
   "devCommand": "npm run dev",
-  "installCommand": "npm install",
-  "functions": {
-    "server/index.js": {
-      "maxDuration": 30,
-      "runtime": "nodejs20.x"
-    }
-  },
+  "outputDirectory": "dist",
   "routes": [
     {
       "src": "/api/(.*)",
-      "dest": "server/index.js"
-    },
-    {
-      "src": "/uploads/(.*)",
-      "dest": "server/index.js"
+      "dest": "/api/index.js"
     },
     {
       "src": "/(.*)",
       "dest": "/index.html"
     }
-  ],
-  "outputDirectory": "dist"
+  ]
 }
