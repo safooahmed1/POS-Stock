@@ -2,12 +2,14 @@
   "version": 2,
   "installCommand": "npm install && cd client && npm install",
   "buildCommand": "cd client && npm run build && cd .. && cp -r client/dist dist",
-  "devCommand": "npm run dev",
   "outputDirectory": "dist",
   "routes": [
     {
       "src": "/api/(.*)",
       "dest": "/api/index.js"
+    },
+    {
+      "handle": "filesystem"
     },
     {
       "src": "/(.*)",
