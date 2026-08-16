@@ -9,6 +9,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const uploadsDir = join(__dirname, 'uploads');
 if (!existsSync(uploadsDir)) mkdirSync(uploadsDir);
 
+await db.init();
+
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadsDir),
   filename: (_req, file, cb) =>
@@ -19,9 +21,6 @@ const upload = multer({ storage });
 const app = express();
 app.use(express.json());
 app.use('/uploads', express.static(uploadsDir));
-
-const getVariantStmt = db.prepare('SELECT * FROM variants WHERE id = ?');
-const getProductStmt = db.prepare('SELECT * FROM products WHERE id = ?');
 
 function sizeOrNull(value) {
   if (value === undefined || value === null) return null;
@@ -59,18 +58,19 @@ function validateVariants(variants) {
   return { variants: variants.map((v) => ({ ...v, color: String(v.color).trim(), size: String(v.size).trim(), quantity: parseQuantity(v.quantity) })) };
 }
 
-function skuExists(sku, excludeId) {
+async function skuExists(sku, excludeId) {
   const stmt = db.prepare('SELECT id FROM products WHERE LOWER(sku) = LOWER(?) AND id != ?');
-  return !!stmt.get(sku, excludeId || -1);
+  const row = await stmt.get(sku, excludeId || -1);
+  return !!row;
 }
 
-function validateProductBody(body) {
+async function validateProductBody(body) {
   const name = sizeOrNull(body.name);
   if (!name) return { error: 'Product name cannot be empty.' };
   const price = parsePrice(body.price);
   if (price === null) return { error: 'Price must be a valid non-negative number.' };
   const sku = sizeOrNull(body.sku);
-  if (sku && skuExists(sku, body.id)) return { error: `SKU "${sku}" already exists.` };
+  if (sku && await skuExists(sku, body.id)) return { error: `SKU "${sku}" already exists.` };
   return { name, sku, price };
 }
 
@@ -98,8 +98,8 @@ function attachTotals(product, variants) {
   return { ...product, variants, total_quantity, color_totals };
 }
 
-function getProductById(id, filters = {}) {
-  const product = getProductStmt.get(id);
+async function getProductById(id, filters = {}) {
+  const product = await db.prepare('SELECT * FROM products WHERE id = ?').get(id);
   if (!product) return null;
   let query = 'SELECT * FROM variants WHERE product_id = ?';
   const params = [id];
@@ -112,7 +112,7 @@ function getProductById(id, filters = {}) {
     params.push(String(filters.size));
   }
   query += ' ORDER BY color COLLATE NOCASE ASC, size COLLATE NOCASE ASC';
-  const variants = db.prepare(query).all(...params);
+  const variants = await db.prepare(query).all(...params);
   return attachTotals(product, variants);
 }
 
@@ -128,50 +128,61 @@ function deleteUploadedImage(path) {
 
 // ---------- Products ----------
 
-app.get('/api/products', (req, res) => {
-  const search = sizeOrNull(req.query.search);
-  const color = sizeOrNull(req.query.color);
-  const size = sizeOrNull(req.query.size);
-
-  const products = db.prepare('SELECT * FROM products ORDER BY name COLLATE NOCASE ASC').all();
-
-  const filtered = products.filter((p) => {
-    if (!search) return true;
-    const term = search.toLowerCase();
-    return (
-      (p.name || '').toLowerCase().includes(term) ||
-      (p.sku || '').toLowerCase().includes(term)
-    );
-  });
-
-  const items = filtered
-    .map((p) => getProductById(p.id, { color, size }))
-    .filter((p) => !color && !size ? true : p.variants.length > 0);
-
-  const totalPieces = items.reduce((sum, p) => sum + p.total_quantity, 0);
-
-  res.json({ products: items, count: items.length, totalPieces });
-});
-
-app.get('/api/products/:id', (req, res) => {
-  const product = getProductById(req.params.id);
-  if (!product) return res.status(404).json({ error: 'Product not found.' });
-  res.json(product);
-});
-
-app.post('/api/products', upload.single('image'), (req, res) => {
-  const validation = validateProductBody(req.body);
-  if (validation.error) return res.status(400).json({ error: validation.error });
-
-  const rawVariants = variantsFromBody(req.body);
-  const variantsCheck = validateVariants(rawVariants === null ? null : rawVariants);
-  if (variantsCheck.error) {
-    if (req.file) deleteUploadedImage(`/uploads/${req.file.filename}`);
-    return res.status(400).json({ error: variantsCheck.error });
-  }
-
+app.get('/api/products', async (req, res) => {
   try {
-    const result = db
+    const search = sizeOrNull(req.query.search);
+    const color = sizeOrNull(req.query.color);
+    const size = sizeOrNull(req.query.size);
+
+    const products = await db.prepare('SELECT * FROM products ORDER BY name COLLATE NOCASE ASC').all();
+
+    const filtered = products.filter((p) => {
+      if (!search) return true;
+      const term = search.toLowerCase();
+      return (
+        (p.name || '').toLowerCase().includes(term) ||
+        (p.sku || '').toLowerCase().includes(term)
+      );
+    });
+
+    const items = filtered
+      .map((p) => getProductById(p.id, { color, size }))
+      .filter((p) => !color && !size ? true : p.variants.length > 0);
+
+    const resolvedItems = await Promise.all(items);
+    const totalPieces = resolvedItems.reduce((sum, p) => sum + p.total_quantity, 0);
+
+    res.json({ products: resolvedItems, count: resolvedItems.length, totalPieces });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch products.' });
+  }
+});
+
+app.get('/api/products/:id', async (req, res) => {
+  try {
+    const product = await getProductById(req.params.id);
+    if (!product) return res.status(404).json({ error: 'Product not found.' });
+    res.json(product);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch product.' });
+  }
+});
+
+app.post('/api/products', upload.single('image'), async (req, res) => {
+  try {
+    const validation = await validateProductBody(req.body);
+    if (validation.error) return res.status(400).json({ error: validation.error });
+
+    const rawVariants = variantsFromBody(req.body);
+    const variantsCheck = validateVariants(rawVariants === null ? null : rawVariants);
+    if (variantsCheck.error) {
+      if (req.file) deleteUploadedImage(`/uploads/${req.file.filename}`);
+      return res.status(400).json({ error: variantsCheck.error });
+    }
+
+    const result = await db
       .prepare('INSERT INTO products (name, sku, price, image) VALUES (?, ?, ?, ?)')
       .run(validation.name, validation.sku, validation.price, req.file ? `/uploads/${req.file.filename}` : null);
     const productId = result.lastInsertRowid;
@@ -179,14 +190,14 @@ app.post('/api/products', upload.single('image'), (req, res) => {
     const insertVariant = db.prepare(
       'INSERT INTO variants (product_id, color, size, quantity) VALUES (?, ?, ?, ?)'
     );
-    const tx = db.transaction((variants) => {
+    const tx = db.transaction(async (variants) => {
       for (const v of variants) {
-        insertVariant.run(productId, v.color, v.size, v.quantity);
+        await insertVariant.run(productId, v.color, v.size, v.quantity);
       }
     });
-    tx(variantsCheck.variants);
+    await tx(variantsCheck.variants);
 
-    const product = getProductById(productId);
+    const product = await getProductById(productId);
     res.status(201).json(product);
   } catch (err) {
     console.error(err);
@@ -195,43 +206,43 @@ app.post('/api/products', upload.single('image'), (req, res) => {
   }
 });
 
-app.put('/api/products/:id', upload.single('image'), (req, res) => {
-  const existing = getProductStmt.get(req.params.id);
-  if (!existing) return res.status(404).json({ error: 'Product not found.' });
-
-  const validation = validateProductBody({ ...req.body, id: existing.id });
-  if (validation.error) return res.status(400).json({ error: validation.error });
-
-  const rawVariants = variantsFromBody(req.body);
-  const variantsCheck = validateVariants(rawVariants === null ? null : rawVariants);
-  if (variantsCheck.error) {
-    deleteUploadedImage(req.file && `/uploads/${req.file.filename}`);
-    return res.status(400).json({ error: variantsCheck.error });
-  }
-
-  let image = existing.image;
-  if (req.file) image = `/uploads/${req.file.filename}`;
-  else if (sizeOrNull(req.body.image)) image = sizeOrNull(req.body.image);
-  else if (req.body.remove_image === '1') image = null;
-
+app.put('/api/products/:id', upload.single('image'), async (req, res) => {
   try {
-    db.prepare(
+    const existing = await db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Product not found.' });
+
+    const validation = await validateProductBody({ ...req.body, id: existing.id });
+    if (validation.error) return res.status(400).json({ error: validation.error });
+
+    const rawVariants = variantsFromBody(req.body);
+    const variantsCheck = validateVariants(rawVariants === null ? null : rawVariants);
+    if (variantsCheck.error) {
+      deleteUploadedImage(req.file && `/uploads/${req.file.filename}`);
+      return res.status(400).json({ error: variantsCheck.error });
+    }
+
+    let image = existing.image;
+    if (req.file) image = `/uploads/${req.file.filename}`;
+    else if (sizeOrNull(req.body.image)) image = sizeOrNull(req.body.image);
+    else if (req.body.remove_image === '1') image = null;
+
+    await db.prepare(
       "UPDATE products SET name = ?, sku = ?, price = ?, image = ?, updated_at = datetime('now') WHERE id = ?"
     ).run(validation.name, validation.sku, validation.price, image, existing.id);
 
-    db.prepare('DELETE FROM variants WHERE product_id = ?').run(existing.id);
+    await db.prepare('DELETE FROM variants WHERE product_id = ?').run(existing.id);
     const insertVariant = db.prepare(
       'INSERT INTO variants (product_id, color, size, quantity) VALUES (?, ?, ?, ?)'
     );
-    const tx = db.transaction((variants) => {
+    const tx = db.transaction(async (variants) => {
       for (const v of variants) {
-        insertVariant.run(existing.id, v.color, v.size, v.quantity);
+        await insertVariant.run(existing.id, v.color, v.size, v.quantity);
       }
     });
-    tx(variantsCheck.variants);
+    await tx(variantsCheck.variants);
 
     if (req.file) deleteUploadedImage(existing.image);
-    res.json(getProductById(existing.id));
+    res.json(await getProductById(existing.id));
   } catch (err) {
     console.error(err);
     deleteUploadedImage(req.file && `/uploads/${req.file.filename}`);
@@ -239,64 +250,85 @@ app.put('/api/products/:id', upload.single('image'), (req, res) => {
   }
 });
 
-app.delete('/api/products/:id', (req, res) => {
-  const existing = getProductStmt.get(req.params.id);
-  if (!existing) return res.status(404).json({ error: 'Product not found.' });
-  db.prepare('DELETE FROM products WHERE id = ?').run(existing.id);
-  deleteUploadedImage(existing.image);
-  res.json({ message: 'Product deleted successfully.' });
+app.delete('/api/products/:id', async (req, res) => {
+  try {
+    const existing = await db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Product not found.' });
+    await db.prepare('DELETE FROM products WHERE id = ?').run(existing.id);
+    deleteUploadedImage(existing.image);
+    res.json({ message: 'Product deleted successfully.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete product.' });
+  }
 });
 
 // ---------- Variants ----------
 
-app.post('/api/products/:id/variants', (req, res) => {
-  const existing = getProductStmt.get(req.params.id);
-  if (!existing) return res.status(404).json({ error: 'Product not found.' });
+app.post('/api/products/:id/variants', async (req, res) => {
+  try {
+    const existing = await db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Product not found.' });
 
-  const check = validateVariants([req.body]);
-  if (check.error) return res.status(400).json({ error: check.error });
+    const check = validateVariants([req.body]);
+    if (check.error) return res.status(400).json({ error: check.error });
 
-  const v = check.variants[0];
-  const dup = db
-    .prepare('SELECT * FROM variants WHERE product_id = ? AND LOWER(color) = LOWER(?) AND LOWER(size) = LOWER(?)')
-    .get(existing.id, v.color, v.size);
-  if (dup) return res.status(409).json({ error: `Size ${v.size} in ${v.color} already exists.` });
+    const v = check.variants[0];
+    const dup = await db
+      .prepare('SELECT * FROM variants WHERE product_id = ? AND LOWER(color) = LOWER(?) AND LOWER(size) = LOWER(?)')
+      .get(existing.id, v.color, v.size);
+    if (dup) return res.status(409).json({ error: `Size ${v.size} in ${v.color} already exists.` });
 
-  const result = db
-    .prepare('INSERT INTO variants (product_id, color, size, quantity) VALUES (?, ?, ?, ?)')
-    .run(existing.id, v.color, v.size, v.quantity);
-  res.status(201).json(getVariantStmt.get(result.lastInsertRowid));
+    const result = await db
+      .prepare('INSERT INTO variants (product_id, color, size, quantity) VALUES (?, ?, ?, ?)')
+      .run(existing.id, v.color, v.size, v.quantity);
+    const variant = await db.prepare('SELECT * FROM variants WHERE id = ?').get(result.lastInsertRowid);
+    res.status(201).json(variant);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create variant.' });
+  }
 });
 
-app.put('/api/variants/:id', (req, res) => {
-  const variant = getVariantStmt.get(req.params.id);
-  if (!variant) return res.status(404).json({ error: 'Variant not found.' });
+app.put('/api/variants/:id', async (req, res) => {
+  try {
+    const variant = await db.prepare('SELECT * FROM variants WHERE id = ?').get(req.params.id);
+    if (!variant) return res.status(404).json({ error: 'Variant not found.' });
 
-  const color = sizeOrNull(req.body.color) ?? variant.color;
-  const size = sizeOrNull(req.body.size) ?? variant.size;
-  const quantity = req.body.quantity === undefined
-    ? variant.quantity
-    : parseQuantity(req.body.quantity);
+    const color = sizeOrNull(req.body.color) ?? variant.color;
+    const size = sizeOrNull(req.body.size) ?? variant.size;
+    const quantity = req.body.quantity === undefined
+      ? variant.quantity
+      : parseQuantity(req.body.quantity);
 
-  if (!color) return res.status(400).json({ error: 'Color cannot be empty.' });
-  if (!size) return res.status(400).json({ error: 'Size cannot be empty.' });
-  if (quantity === null) return res.status(400).json({ error: 'Quantity must be a non-negative integer.' });
+    if (!color) return res.status(400).json({ error: 'Color cannot be empty.' });
+    if (!size) return res.status(400).json({ error: 'Size cannot be empty.' });
+    if (quantity === null) return res.status(400).json({ error: 'Quantity must be a non-negative integer.' });
 
-  const dup = db
-    .prepare('SELECT * FROM variants WHERE product_id = ? AND LOWER(color) = LOWER(?) AND LOWER(size) = LOWER(?) AND id != ?')
-    .get(variant.product_id, color, size, variant.id);
-  if (dup) return res.status(409).json({ error: `Size ${size} in ${color} already exists.` });
+    const dup = await db
+      .prepare('SELECT * FROM variants WHERE product_id = ? AND LOWER(color) = LOWER(?) AND LOWER(size) = LOWER(?) AND id != ?')
+      .get(variant.product_id, color, size, variant.id);
+    if (dup) return res.status(409).json({ error: `Size ${size} in ${color} already exists.` });
 
-  db.prepare("UPDATE variants SET color = ?, size = ?, quantity = ?, updated_at = datetime('now') WHERE id = ?")
-    .run(color, size, quantity, variant.id);
-  res.json(getVariantStmt.get(variant.id));
+    await db.prepare("UPDATE variants SET color = ?, size = ?, quantity = ?, updated_at = datetime('now') WHERE id = ?")
+      .run(color, size, quantity, variant.id);
+    res.json(await db.prepare('SELECT * FROM variants WHERE id = ?').get(variant.id));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update variant.' });
+  }
 });
 
-app.delete('/api/variants/:id', (req, res) => {
-  const variant = getVariantStmt.get(req.params.id);
-  if (!variant) return res.status(404).json({ error: 'Variant not found.' });
-  db.prepare('DELETE FROM variants WHERE id = ?').run(variant.id);
-  res.json({ message: 'Variant deleted successfully.' });
+app.delete('/api/variants/:id', async (req, res) => {
+  try {
+    const variant = await db.prepare('SELECT * FROM variants WHERE id = ?').get(req.params.id);
+    if (!variant) return res.status(404).json({ error: 'Variant not found.' });
+    await db.prepare('DELETE FROM variants WHERE id = ?').run(variant.id);
+    res.json({ message: 'Variant deleted successfully.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete variant.' });
+  }
 });
 
 // ---------- Serve built client in production ----------
