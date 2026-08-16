@@ -5,7 +5,8 @@
   "installCommand": "npm install",
   "functions": {
     "server/index.js": {
-      "maxDuration": 30
+      "maxDuration": 30,
+      "runtime": "nodejs20.x"
     }
   },
   "routes": [
@@ -22,5 +23,14 @@
       "dest": "/index.html"
     }
   ],
-  "outputDirectory": "client/dist"
+  "builds": [
+    {
+      "src": "client/dist/**",
+      "use": "@vercel/static"
+    },
+    {
+      "src": "server/index.js",
+      "use": "@vercel/node"
+    }
+  ]
 }
