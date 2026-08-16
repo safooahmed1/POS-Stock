@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "buildCommand": "npm run build",
+  "buildCommand": "npm run build && cp -r client/dist dist",
   "devCommand": "npm run dev",
   "installCommand": "npm install",
   "functions": {
@@ -23,14 +23,5 @@
       "dest": "/index.html"
     }
   ],
-  "builds": [
-    {
-      "src": "client/dist/**",
-      "use": "@vercel/static"
-    },
-    {
-      "src": "server/index.js",
-      "use": "@vercel/node"
-    }
-  ]
+  "outputDirectory": "dist"
 }
