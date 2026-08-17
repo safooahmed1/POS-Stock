@@ -4,7 +4,9 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "node --watch --env-file=.env api/index.js",
+    "dev": "concurrently --names server,client --prefix-colors blue,green \"node --watch --env-file=.env api/index.js\" \"cd client && npm run dev\"",
+    "dev:server": "node --watch --env-file=.env api/index.js",
+    "dev:client": "cd client && npm run dev",
     "build": "cd client && npm run build",
     "postbuild": "cp -r client/dist dist",
     "start": "node --env-file=.env api/index.js"

@@ -1,24 +1,20 @@
 import express from 'express';
 import multer from 'multer';
-import { existsSync, mkdirSync, unlinkSync, rmSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { dirname, join, extname } from 'path';
+import { dirname } from 'path';
 import db from './db.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const uploadsDir = join(__dirname, '.uploads');
 
-await db.init();
+let dbReady = false;
+async function ensureDb() {
+  if (!dbReady) {
+    await db.init();
+    dbReady = true;
+  }
+}
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    if (!existsSync(uploadsDir)) mkdirSync(uploadsDir, { recursive: true });
-    cb(null, uploadsDir);
-  },
-  filename: (_req, file, cb) =>
-    cb(null, `img-${Date.now()}${extname(file.originalname).toLowerCase()}`),
-});
-const upload = multer({ storage });
+const upload = multer({ storage: multer.memoryStorage() });
 
 const app = express();
 app.use(express.json());
@@ -117,20 +113,18 @@ async function getProductById(id, filters = {}) {
   return attachTotals(product, variants);
 }
 
-function deleteUploadedImage(path) {
-  if (!path || !path.startsWith('/uploads/')) return;
-  const file = join(uploadsDir, path.replace('/uploads/', ''));
-  try {
-    unlinkSync(file);
-  } catch {
-    /* ignore missing files */
-  }
+function extractImageUrl(req) {
+  if (!req.file) return null;
+  const ext = (req.file.originalname.split('.').pop() || 'png').toLowerCase();
+  const filename = `img-${Date.now()}.${ext}`;
+  return `/api/uploads/${filename}`;
 }
 
 // ---------- Products ----------
 
 app.get('/api/products', async (req, res) => {
   try {
+    await ensureDb();
     const search = sizeOrNull(req.query.search);
     const color = sizeOrNull(req.query.color);
     const size = sizeOrNull(req.query.size);
@@ -162,6 +156,7 @@ app.get('/api/products', async (req, res) => {
 
 app.get('/api/products/:id', async (req, res) => {
   try {
+    await ensureDb();
     const product = await getProductById(req.params.id);
     if (!product) return res.status(404).json({ error: 'Product not found.' });
     res.json(product);
@@ -173,42 +168,42 @@ app.get('/api/products/:id', async (req, res) => {
 
 app.post('/api/products', upload.single('image'), async (req, res) => {
   try {
+    await ensureDb();
     const validation = await validateProductBody(req.body);
     if (validation.error) return res.status(400).json({ error: validation.error });
 
     const rawVariants = variantsFromBody(req.body);
     const variantsCheck = validateVariants(rawVariants === null ? null : rawVariants);
     if (variantsCheck.error) {
-      if (req.file) deleteUploadedImage(`/uploads/${req.file.filename}`);
       return res.status(400).json({ error: variantsCheck.error });
     }
 
+    const imageUrl = extractImageUrl(req);
     const result = await db
       .prepare('INSERT INTO products (name, sku, price, image) VALUES (?, ?, ?, ?)')
-      .run(validation.name, validation.sku, validation.price, req.file ? `/uploads/${req.file.filename}` : null);
+      .run(validation.name, validation.sku, validation.price, imageUrl);
     const productId = result.lastInsertRowid;
 
-    const insertVariant = db.prepare(
-      'INSERT INTO variants (product_id, color, size, quantity) VALUES (?, ?, ?, ?)'
-    );
-    const tx = db.transaction(async (variants) => {
-      for (const v of variants) {
+    await db.transaction(async (txClient) => {
+      const insertVariant = txClient.prepare(
+        'INSERT INTO variants (product_id, color, size, quantity) VALUES (?, ?, ?, ?)'
+      );
+      for (const v of variantsCheck.variants) {
         await insertVariant.run(productId, v.color, v.size, v.quantity);
       }
     });
-    await tx(variantsCheck.variants);
 
     const product = await getProductById(productId);
     res.status(201).json(product);
   } catch (err) {
     console.error(err);
-    deleteUploadedImage(req.file && `/uploads/${req.file.filename}`);
     res.status(500).json({ error: 'Something went wrong while saving the product.' });
   }
 });
 
 app.put('/api/products/:id', upload.single('image'), async (req, res) => {
   try {
+    await ensureDb();
     const existing = await db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Product not found.' });
 
@@ -218,12 +213,11 @@ app.put('/api/products/:id', upload.single('image'), async (req, res) => {
     const rawVariants = variantsFromBody(req.body);
     const variantsCheck = validateVariants(rawVariants === null ? null : rawVariants);
     if (variantsCheck.error) {
-      deleteUploadedImage(req.file && `/uploads/${req.file.filename}`);
       return res.status(400).json({ error: variantsCheck.error });
     }
 
     let image = existing.image;
-    if (req.file) image = `/uploads/${req.file.filename}`;
+    if (req.file) image = extractImageUrl(req);
     else if (sizeOrNull(req.body.image)) image = sizeOrNull(req.body.image);
     else if (req.body.remove_image === '1') image = null;
 
@@ -232,31 +226,28 @@ app.put('/api/products/:id', upload.single('image'), async (req, res) => {
     ).run(validation.name, validation.sku, validation.price, image, existing.id);
 
     await db.prepare('DELETE FROM variants WHERE product_id = ?').run(existing.id);
-    const insertVariant = db.prepare(
-      'INSERT INTO variants (product_id, color, size, quantity) VALUES (?, ?, ?, ?)'
-    );
-    const tx = db.transaction(async (variants) => {
-      for (const v of variants) {
+    await db.transaction(async (txClient) => {
+      const insertVariant = txClient.prepare(
+        'INSERT INTO variants (product_id, color, size, quantity) VALUES (?, ?, ?, ?)'
+      );
+      for (const v of variantsCheck.variants) {
         await insertVariant.run(existing.id, v.color, v.size, v.quantity);
       }
     });
-    await tx(variantsCheck.variants);
 
-    if (req.file) deleteUploadedImage(existing.image);
     res.json(await getProductById(existing.id));
   } catch (err) {
     console.error(err);
-    deleteUploadedImage(req.file && `/uploads/${req.file.filename}`);
     res.status(500).json({ error: 'Something went wrong while updating the product.' });
   }
 });
 
 app.delete('/api/products/:id', async (req, res) => {
   try {
+    await ensureDb();
     const existing = await db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Product not found.' });
     await db.prepare('DELETE FROM products WHERE id = ?').run(existing.id);
-    deleteUploadedImage(existing.image);
     res.json({ message: 'Product deleted successfully.' });
   } catch (err) {
     console.error(err);
@@ -268,6 +259,7 @@ app.delete('/api/products/:id', async (req, res) => {
 
 app.post('/api/products/:id/variants', async (req, res) => {
   try {
+    await ensureDb();
     const existing = await db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Product not found.' });
 
@@ -293,6 +285,7 @@ app.post('/api/products/:id/variants', async (req, res) => {
 
 app.put('/api/variants/:id', async (req, res) => {
   try {
+    await ensureDb();
     const variant = await db.prepare('SELECT * FROM variants WHERE id = ?').get(req.params.id);
     if (!variant) return res.status(404).json({ error: 'Variant not found.' });
 
@@ -322,6 +315,7 @@ app.put('/api/variants/:id', async (req, res) => {
 
 app.delete('/api/variants/:id', async (req, res) => {
   try {
+    await ensureDb();
     const variant = await db.prepare('SELECT * FROM variants WHERE id = ?').get(req.params.id);
     if (!variant) return res.status(404).json({ error: 'Variant not found.' });
     await db.prepare('DELETE FROM variants WHERE id = ?').run(variant.id);
@@ -334,7 +328,6 @@ app.delete('/api/variants/:id', async (req, res) => {
 
 // ---------- Local dev server ----------
 if (!process.env.VERCEL) {
-  app.use('/uploads', express.static(uploadsDir));
   const PORT = process.env.PORT || 5000;
   app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);

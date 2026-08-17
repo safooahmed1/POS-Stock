@@ -78,7 +78,8 @@ function exec(sql) {
 }
 
 function transaction(fn) {
-  return client.transaction(async (tx) => {
+  return (async () => {
+    const tx = await client.transaction();
     const txClient = {
       execute: async ({ sql, args }) => tx.execute({ sql, args }),
       prepare: (sql) => ({
@@ -96,8 +97,15 @@ function transaction(fn) {
         }
       })
     };
-    return fn(txClient);
-  });
+    try {
+      const result = await fn(txClient);
+      await tx.commit();
+      return result;
+    } catch (err) {
+      await tx.rollback();
+      throw err;
+    }
+  })();
 }
 
 function pragma() {
